@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>参加記録スキャン（試作）</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Hiragino Sans", sans-serif; margin: 0; padding: 12px; background: #f4f6f8; color: #222; }
+  h1 { font-size: 18px; margin: 4px 0 10px; }
+  label { font-size: 13px; color: #555; display: block; margin: 10px 0 4px; }
+  select, input[type="text"] { width: 100%; font-size: 17px; padding: 12px; border: 1px solid #bbb; border-radius: 8px; background: #fff; }
+  #videoWrap { position: relative; margin-top: 12px; border-radius: 12px; overflow: hidden; background: #000; }
+  video { width: 100%; display: block; }
+  #scanLine { position: absolute; left: 6%; right: 6%; top: 50%; height: 2px; background: rgba(255,60,60,.85); display: none; }
+  button { width: 100%; font-size: 18px; padding: 14px; border: none; border-radius: 10px; margin-top: 12px; background: #1565c0; color: #fff; }
+  button.stop { background: #c62828; }
+  button.sub { background: #546e7a; font-size: 15px; padding: 11px; }
+  #status { margin-top: 12px; padding: 16px; border-radius: 10px; font-size: 19px; font-weight: 700; text-align: center; background: #e0e0e0; min-height: 60px; }
+  #status.ok  { background: #c8e6c9; color: #1b5e20; }
+  #status.dup { background: #fff9c4; color: #6d4c00; }
+  #status.err { background: #ffcdd2; color: #b71c1c; }
+  #count { text-align: center; font-size: 15px; color: #444; margin-top: 8px; }
+  #recent { margin-top: 14px; font-size: 14px; }
+  #recent h2 { font-size: 14px; color: #555; margin: 0 0 6px; }
+  #recent ul { list-style: none; margin: 0; padding: 0; }
+  #recent li { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 8px 10px; margin-bottom: 6px; display: flex; justify-content: space-between; gap: 8px; }
+  #recent .code { font-family: monospace; word-break: break-all; }
+  .note { font-size: 12px; color: #777; margin-top: 14px; line-height: 1.6; }
+</style>
+</head>
+<body>
+<h1>参加記録スキャン（試作）</h1>
+
+<label for="eventSelect">企画名</label>
+<select id="eventSelect">
+  <option value="">読み込み中…</option>
+</select>
+
+<div id="videoWrap">
+  <video id="video" playsinline muted></video>
+  <div id="scanLine"></div>
+</div>
+
+<button id="toggleBtn">読み取り開始</button>
+
+<div id="status">企画を選んで「読み取り開始」を押してください</div>
+<div id="count"></div>
+
+<label for="manualInput">手入力（テスト用：IDを入力して記録）</label>
+<input type="text" id="manualInput" placeholder="例: N24120105700" autocomplete="off">
+<button id="manualBtn" class="sub">手入力で記録する</button>
+
+<div id="recent">
+  <h2>最近の読み取り</h2>
+  <ul id="recentList"></ul>
+</div>
+
+<p class="note">
+  ・カードのバーコード（1次元コード）をカメラに映すと、自動で記録されます。<br>
+  ・同じ企画で同じカードは2回記録されません（「記録済み」と表示されます）。<br>
+  ・読み取りにくい時は、明るい場所で、バーコードを画面の中央に大きく映してください。
+</p>
+
+<script>
+  // ▼▼▼ Apps Script のウェブアプリ URL（デプロイ後に差し替え）▼▼▼
+  const ENDPOINT = 'https://script.google.com/macros/s/AKfycbz0ArFoV918JOytdZ4ydpOTa4yzgAw0hIcgroi6tS_g5hWuZ-Wb8s6tdT44cx30_HfFRg/exec';
+  // ▲▲▲ ここまで ▲▲▲
+
+  const $ = (id) => document.getElementById(id);
+  const eventSelect = $('eventSelect');
+  const statusEl = $('status');
+  const countEl = $('count');
+  const recentList = $('recentList');
+  const toggleBtn = $('toggleBtn');
+  const scanLine = $('scanLine');
+
+  let reader = null;
+  let controls = null;
+  let scanning = false;
+  const cooldown = new Map(); // code -> last accepted time (ms)
+  const COOLDOWN_MS = 5000;
+
+  function setStatus(text, kind) {
+    statusEl.textContent = text;
+    statusEl.className = kind || '';
+  }
+
+  function beep(freq) {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.frequency.value = freq || 880;
+      osc.connect(gain); gain.connect(ctx.destination);
+      gain.gain.setValueAtTime(0.15, ctx.currentTime);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.12);
+      setTimeout(() => ctx.close(), 300);
+    } catch (e) { /* 音が出なくても記録は続行 */ }
+  }
+
+  function addRecent(code, text) {
+    const li = document.createElement('li');
+    const left = document.createElement('span');
+    left.className = 'code';
+    left.textContent = code;
+    const right = document.createElement('span');
+    right.textContent = text;
+    li.appendChild(left); li.appendChild(right);
+    recentList.prepend(li);
+    while (recentList.children.length > 8) recentList.lastChild.remove();
+  }
+
+  async function api(body) {
+    const res = await fetch(ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(body),
+    });
+    return res.json();
+  }
+
+  async function loadEvents(selectName) {
+    const res = await fetch(ENDPOINT + '?action=events');
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'events load failed');
+    eventSelect.innerHTML = '';
+    data.events.forEach((name) => {
+      const opt = document.createElement('option');
+      opt.value = name; opt.textContent = name;
+      eventSelect.appendChild(opt);
+    });
+    const createOpt = document.createElement('option');
+    createOpt.value = '__create__';
+    createOpt.textContent = '＋ 新しい企画を作る';
+    eventSelect.appendChild(createOpt);
+    if (selectName && data.events.includes(selectName)) {
+      eventSelect.value = selectName;
+    }
+    updateCount();
+  }
+
+  async function updateCount() {
+    const ev = eventSelect.value;
+    if (!ev || ev === '__create__') { countEl.textContent = ''; return; }
+    try {
+      const res = await fetch(ENDPOINT + '?action=count&event=' + encodeURIComponent(ev));
+      const data = await res.json();
+      if (data.ok) countEl.textContent = 'この企画の記録数: ' + data.count + ' 件';
+    } catch (e) { /* 件数表示は補助機能 */ }
+  }
+
+  eventSelect.addEventListener('change', async () => {
+    if (eventSelect.value === '__create__') {
+      const name = prompt('新しい企画名を入力してください');
+      if (!name) { await loadEvents(); return; }
+      setStatus('企画を作成中…', '');
+      try {
+        const data = await api({ action: 'createEvent', event: name });
+        if (!data.ok) throw new Error(data.error || 'create failed');
+        await loadEvents(data.created);
+        setStatus('企画「' + data.created + '」を作成しました', 'ok');
+      } catch (e) {
+        setStatus('企画の作成に失敗しました: ' + e.message, 'err');
+        await loadEvents();
+      }
+      return;
+    }
+    updateCount();
+  });
+
+  async function record(code) {
+    const ev = eventSelect.value;
+    if (!ev || ev === '__create__') {
+      setStatus('先に企画を選んでください', 'err');
+      return;
+    }
+    const now = Date.now();
+    if (cooldown.has(code) && now - cooldown.get(code) < COOLDOWN_MS) return;
+    cooldown.set(code, now);
+
+    try {
+      const data = await api({ action: 'record', event: ev, code: code });
+      if (!data.ok) throw new Error(data.error || 'record failed');
+      const time = new Date().toLocaleTimeString('ja-JP');
+      if (data.status === 'recorded') {
+        beep(880);
+        if (navigator.vibrate) navigator.vibrate(80);
+        setStatus('✓ 記録しました #' + data.no, 'ok');
+        addRecent(code, '#' + data.no + ' ' + time);
+      } else {
+        beep(440);
+        setStatus('記録済みです #' + data.no, 'dup');
+        addRecent(code, '済 #' + data.no + ' ' + time);
+      }
+      countEl.textContent = 'この企画の記録数: ' + data.count + ' 件';
+    } catch (e) {
+      setStatus('記録に失敗しました: ' + e.message, 'err');
+      addRecent(code, '失敗 ' + new Date().toLocaleTimeString('ja-JP'));
+    }
+  }
+
+  $('manualBtn').addEventListener('click', () => {
+    const code = $('manualInput').value.trim();
+    if (!code) return;
+    cooldown.delete(code);
+    record(code);
+    $('manualInput').value = '';
+  });
+
+  async function startScan() {
+    if (!window.__zxingReady) {
+      setStatus('読み取りライブラリの準備中です。少し待ってからもう一度押してください', 'err');
+      return;
+    }
+    try {
+      reader = window.__createReader();
+      const videoEl = $('video');
+      const callback = (result, err) => {
+        if (result) record(result.getText());
+      };
+      const constraints = { video: { facingMode: 'environment' }, audio: false };
+      if (reader.decodeFromConstraints) {
+        controls = await reader.decodeFromConstraints(constraints, videoEl, callback);
+      } else {
+        controls = await reader.decodeFromVideoDevice(undefined, videoEl, callback);
+      }
+      scanning = true;
+      scanLine.style.display = 'block';
+      toggleBtn.textContent = '読み取り停止';
+      toggleBtn.classList.add('stop');
+      setStatus('読み取り中… バーコードを映してください', '');
+    } catch (e) {
+      setStatus('カメラを起動できませんでした: ' + e.message, 'err');
+    }
+  }
+
+  function stopScan() {
+    if (controls) { try { controls.stop(); } catch (e) {} controls = null; }
+    scanning = false;
+    scanLine.style.display = 'none';
+    toggleBtn.textContent = '読み取り開始';
+    toggleBtn.classList.remove('stop');
+    setStatus('停止しました', '');
+  }
+
+  toggleBtn.addEventListener('click', () => { scanning ? stopScan() : startScan(); });
+
+  // 初期化
+  (async () => {
+    if (ENDPOINT.indexOf('__APPS_SCRIPT') === 0) {
+      setStatus('設定が未完了です（記録先URLが入っていません）', 'err');
+      return;
+    }
+    try {
+      await loadEvents();
+      setStatus('企画を選んで「読み取り開始」を押してください', '');
+    } catch (e) {
+      setStatus('企画一覧の読み込みに失敗しました: ' + e.message, 'err');
+    }
+  })();
+</script>
+
+<script type="module">
+  try {
+    const browser = await import('https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/+esm');
+    let lib = null;
+    try { lib = await import('https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/+esm'); } catch (e) {}
+    window.__createReader = () => {
+      let reader = null;
+      if (lib) {
+        try {
+          const hints = new Map();
+          hints.set(lib.DecodeHintType.POSSIBLE_FORMATS, [
+            lib.BarcodeFormat.CODE_39,
+            lib.BarcodeFormat.CODE_128,
+            lib.BarcodeFormat.EAN_13,
+            lib.BarcodeFormat.QR_CODE,
+          ]);
+          hints.set(lib.DecodeHintType.TRY_HARDER, true);
+          reader = new browser.BrowserMultiFormatReader(hints, { delayBetweenScanAttempts: 150 });
+        } catch (e) { reader = null; }
+      }
+      if (!reader) reader = new browser.BrowserMultiFormatReader();
+      return reader;
+    };
+    window.__zxingReady = true;
+  } catch (e) {
+    window.__zxingReady = false;
+    document.getElementById('status').textContent = '読み取りライブラリを読み込めませんでした（通信環境を確認してください）';
+    document.getElementById('status').className = 'err';
+  }
+</script>
+</body>
+</html>
